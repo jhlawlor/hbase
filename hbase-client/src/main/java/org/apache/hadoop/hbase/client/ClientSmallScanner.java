@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.client;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 
 import org.apache.commons.logging.Log;
@@ -189,6 +190,7 @@ public class ClientSmallScanner extends ClientScanner {
 
   @Override
   public Result next() throws IOException {
+    System.out.println("ClientSmallScanner:next()");
     // If the scanner is closed and there's nothing left in the cache, next is a
     // no-op.
     if (cache.size() == 0 && this.closed) {
@@ -201,12 +203,13 @@ public class ClientSmallScanner extends ClientScanner {
       boolean currentRegionDone = false;
       // Values == null means server-side filter has determined we must STOP
       while (remainingResultSize > 0 && countdown > 0
-          && nextScanner(countdown, values == null, currentRegionDone)) {
+          && (partialResultReturned || nextScanner(countdown, values == null, currentRegionDone))) {
         // Server returns a null values if scanning is to stop. Else,
         // returns an empty array if scanning is to go on and we've just
         // exhausted current region.
         // callWithoutRetries is at this layer. Within the ScannerCallableWithReplicas,
         // we do a callWithRetries
+        partialResultReturned = false;
         values = this.caller.callWithoutRetries(smallScanCallable, scannerTimeout);
         this.currentRegion = smallScanCallable.getHRegionInfo();
         long currentTime = System.currentTimeMillis();
@@ -216,8 +219,9 @@ public class ClientSmallScanner extends ClientScanner {
         }
         lastNext = currentTime;
         if (values != null && values.length > 0) {
-          for (int i = 0; i < values.length; i++) {
-            Result rs = values[i];
+          List<Result> resultsToAddToCache = handlePartialResults(values);
+          for (int i = 0; i < resultsToAddToCache.size(); i++) {
+            Result rs = resultsToAddToCache.get(i);
             if (i == 0 && this.skipRowOfFirstResult != null
                 && Bytes.equals(skipRowOfFirstResult, rs.getRow())) {
               // Skip the first result

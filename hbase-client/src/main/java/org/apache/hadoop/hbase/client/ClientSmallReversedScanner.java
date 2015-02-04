@@ -21,6 +21,7 @@ package org.apache.hadoop.hbase.client;
 
 
 import java.io.IOException;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 
 import org.apache.commons.logging.Log;
@@ -83,6 +84,8 @@ public class ClientSmallReversedScanner extends ReversedClientScanner {
     int cacheNum = nbRows;
     skipRowOfFirstResult = null;
     // if we're at end of table, close and return false to stop iterating
+    System.out.println("(this.currentRegion != null && currentRegionDone): "
+        + (this.currentRegion != null && currentRegionDone));
     if (this.currentRegion != null && currentRegionDone) {
       byte[] startKey = this.currentRegion.getStartKey();
       if (startKey == null
@@ -101,8 +104,10 @@ public class ClientSmallReversedScanner extends ReversedClientScanner {
       }
     } else if (this.lastResult != null) {
       localStartKey = this.lastResult.getRow();
-      skipRowOfFirstResult = this.lastResult.getRow();
-      cacheNum++;
+      if (!this.lastResult.isPartial()) {
+        skipRowOfFirstResult = this.lastResult.getRow();
+        cacheNum++;
+      }
     } else {
       localStartKey = this.scan.getStartRow();
     }
@@ -125,6 +130,7 @@ public class ClientSmallReversedScanner extends ReversedClientScanner {
 
   @Override
   public Result next() throws IOException {
+    System.out.println("ClientSmallReversedScanner:next()");
     // If the scanner is closed and there's nothing left in the cache, next is a
     // no-op.
     if (cache.size() == 0 && this.closed) {
@@ -137,12 +143,13 @@ public class ClientSmallReversedScanner extends ReversedClientScanner {
       boolean currentRegionDone = false;
       // Values == null means server-side filter has determined we must STOP
       while (remainingResultSize > 0 && countdown > 0
-          && nextScanner(countdown, values == null, currentRegionDone)) {
+          && (nextScanner(countdown, values == null, currentRegionDone))) {
         // Server returns a null values if scanning is to stop. Else,
         // returns an empty array if scanning is to go on and we've just
         // exhausted current region.
         // callWithoutRetries is at this layer. Within the ScannerCallableWithReplicas,
         // we do a callWithRetries
+        partialResultReturned = false;
         values = this.caller.callWithoutRetries(smallScanCallable, scannerTimeout);
         this.currentRegion = smallScanCallable.getHRegionInfo();
         long currentTime = System.currentTimeMillis();
@@ -152,8 +159,10 @@ public class ClientSmallReversedScanner extends ReversedClientScanner {
         }
         lastNext = currentTime;
         if (values != null && values.length > 0) {
-          for (int i = 0; i < values.length; i++) {
-            Result rs = values[i];
+          List<Result> resultsToAddToCache = handlePartialResults(values);
+          this.lastResult = values[values.length - 1];
+          for (int i = 0; i < resultsToAddToCache.size(); i++) {
+            Result rs = resultsToAddToCache.get(i);
             if (i == 0 && this.skipRowOfFirstResult != null
                 && Bytes.equals(skipRowOfFirstResult, rs.getRow())) {
               // Skip the first result
@@ -165,10 +174,9 @@ public class ClientSmallReversedScanner extends ReversedClientScanner {
               remainingResultSize -= CellUtil.estimatedHeapSizeOf(cell);
             }
             countdown--;
-            this.lastResult = rs;
           }
         }
-        currentRegionDone = countdown > 0;
+        currentRegionDone = !partialResultReturned && countdown > 0;
       }
     }
 

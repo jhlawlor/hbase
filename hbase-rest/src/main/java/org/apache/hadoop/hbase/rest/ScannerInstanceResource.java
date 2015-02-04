@@ -33,11 +33,10 @@ import javax.ws.rs.core.UriInfo;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.rest.model.CellModel;
 import org.apache.hadoop.hbase.rest.model.CellSetModel;
 import org.apache.hadoop.hbase.rest.model.RowModel;
@@ -74,6 +73,7 @@ public class ScannerInstanceResource extends ResourceBase {
     MIMETYPE_PROTOBUF_IETF})
   public Response get(final @Context UriInfo uriInfo, 
       @QueryParam("n") int maxRows, final @QueryParam("c") int maxValues) {
+    System.out.println("***ScannerInstance:get***");
     if (LOG.isDebugEnabled()) {
       LOG.debug("GET " + uriInfo.getAbsolutePath());
     }

@@ -80,6 +80,15 @@ public class Result implements CellScannable, CellScanner {
   private Cell[] cells;
   private Boolean exists; // if the query was just to check existence.
   private boolean stale = false;
+
+  /**
+   * Partial results do not contain the full row's worth of cells. The result had to be returned in
+   * parts because the size of the cells in the row exceeded the RPC chunk size on the server.
+   * Partial results must be combined with results representing the remainder of the row's cells.
+   * The concept of partial results and RPC chunk size allow us to avoid OOME on the server when
+   * servicing requests for large rows because we can send the row's result back in pieces
+   */
+  private boolean partial = false;
   // We're not using java serialization.  Transient here is just a marker to say
   // that this is where we cache row if we're ever asked for it.
   private transient byte [] row = null;
@@ -115,7 +124,7 @@ public class Result implements CellScannable, CellScanner {
    * @param cells List of cells
    */
   public static Result create(List<Cell> cells) {
-    return new Result(cells.toArray(new Cell[cells.size()]), null, false);
+    return create(cells, null);
   }
 
   public static Result create(List<Cell> cells, Boolean exists) {
@@ -123,10 +132,14 @@ public class Result implements CellScannable, CellScanner {
   }
 
   public static Result create(List<Cell> cells, Boolean exists, boolean stale) {
+    return create(cells, exists, stale, false);
+  }
+
+  public static Result create(List<Cell> cells, Boolean exists, boolean stale, boolean partial) {
     if (exists != null){
-      return new Result(null, exists, stale);
+      return new Result(null, exists, stale, partial);
     }
-    return new Result(cells.toArray(new Cell[cells.size()]), null, stale);
+    return new Result(cells.toArray(new Cell[cells.size()]), null, stale, partial);
   }
 
   /**
@@ -135,21 +148,26 @@ public class Result implements CellScannable, CellScanner {
    * @param cells array of cells
    */
   public static Result create(Cell[] cells) {
-    return new Result(cells, null, false);
+    return create(cells, null, false);
   }
 
   public static Result create(Cell[] cells, Boolean exists, boolean stale) {
+    return create(cells, exists, stale, false);
+  }
+
+  public static Result create(Cell[] cells, Boolean exists, boolean stale, boolean partial) {
     if (exists != null){
-      return new Result(null, exists, stale);
+      return new Result(null, exists, stale, partial);
     }
-    return new Result(cells, null, stale);
+    return new Result(cells, null, stale, partial);
   }
 
   /** Private ctor. Use {@link #create(Cell[])}. */
-  private Result(Cell[] cells, Boolean exists, boolean stale) {
+  private Result(Cell[] cells, Boolean exists, boolean stale, boolean partial) {
     this.cells = cells;
     this.exists = exists;
     this.stale = stale;
+    this.partial = partial;
   }
 
   /**
@@ -741,6 +759,66 @@ public class Result implements CellScannable, CellScanner {
   }
 
   /**
+   * @param results The results to search through for a partial
+   * @return the result marked as a partial. There should only ever be a single partial result and
+   *         it should always be the last element in the array (if it exists). Partial results are
+   *         formed when the rpcChunkSize is exceed on the server. Since having more than one
+   *         partial result in the array represents an inconsistent state, the entire array is
+   *         searched to make sure we are in a consistent state.
+   */
+  public static Result findPartialIfExists(Result[] results) {
+    if (results == null || results.length == 0) return null;
+
+    Result returnResult = null;
+    boolean partialFound = false;
+    for (int i = 0; i < results.length; i++) {
+      Result r = results[i];
+
+      if (r.isPartial()) {
+        if (partialFound || (i != results.length - 1)) {
+          // TODO: error situation... how to handle?
+        }
+        partialFound = true;
+        returnResult = r;
+      }
+    }
+    return returnResult;
+  }
+
+  /**
+   * Forms a single result from the partial results in the partialResults list and the lastResult.
+   * This method is useful for reconstructing partial results on the client side. Partial results
+   * are formed when the maxResultSize limit is exceeded on the server. When the limit is exceeded
+   * the cells for a particular row being scanned will be returned as partials/fragments
+   * @param partialResults list of partial results
+   * @param lastResult the final result of the row that was being returned as partials
+   * @return the complete result
+   */
+  public static Result createCompleteResult(List<Result> partialResults, Result lastResult) {
+    List<Cell> cells = new ArrayList<Cell>();
+    boolean stale = false;
+
+    for (Result r : partialResults) {
+      stale = stale || r.isStale();
+      for (Cell c : r.rawCells()) {
+        cells.add(c);
+      }
+    }
+
+    // last result may be null. This occurs when we think that there are more results on the server
+    // that should be part of the complete result, but those cells end up being excluded/skipped
+    // in the store scanner
+    if (lastResult != null) {
+      stale = stale || lastResult.isStale();
+      for (Cell c : lastResult.rawCells()) {
+        cells.add(c);
+      }
+    }
+
+    return Result.create(cells, null, stale);
+  }
+
+  /**
    * Get total size of raw cells 
    * @param result
    * @return Total size.
@@ -797,6 +875,20 @@ public class Result implements CellScannable, CellScanner {
    */
   public boolean isStale() {
     return stale;
+  }
+
+  /**
+   * Whether or not the result is a partial result. Partial results contain a subset of the cells
+   * for a row and should be combined with a result representing the remaining cells in that row to
+   * form a complete (non-partial) result.
+   * @return
+   */
+  public boolean isPartial() {
+    return partial;
+  }
+
+  public void setPartial(boolean partial) {
+    this.partial = partial;
   }
 
   /**

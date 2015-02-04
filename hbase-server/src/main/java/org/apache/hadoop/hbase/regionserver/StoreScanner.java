@@ -30,7 +30,6 @@ import java.util.concurrent.locks.ReentrantLock;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.DoNotRetryIOException;
@@ -38,6 +37,7 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.KeyValue.KVComparator;
 import org.apache.hadoop.hbase.KeyValueUtil;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.client.IsolationLevel;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.executor.ExecutorService;
@@ -449,6 +449,19 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
    */
   @Override
   public boolean next(List<Cell> outResult, int limit) throws IOException {
+    // -1 means no limit
+    return next(outResult, limit, -1);
+  }
+
+  /**
+   * Get the next row of values from this Store.
+   * @param outResult
+   * @param limit
+   * @param remainingResultSize
+   * @return true if there are more rows, false if scanner is done
+   */
+  @Override
+  public boolean next(List<Cell> outResult, int limit, long remainingResultSize) throws IOException {
     lock.lock();
     try {
     if (checkReseek()) {
@@ -473,10 +486,15 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
     byte[] row = peeked.getRowArray();
     int offset = peeked.getRowOffset();
     short length = peeked.getRowLength();
-    if (limit < 0 || matcher.row == null || !Bytes.equals(row, offset, length, matcher.row,
-        matcher.rowOffset, matcher.rowLength)) {
-      this.countPerRow = 0;
-      matcher.setRow(row, offset, length);
+
+    // If limit < 0 and remainingResultSize < 0 we can skip the row comparison because we know
+    // the row has changed. Else it is possible we are still traversing the same row so we
+    // must perform the row comparison.
+      if ((limit < 0 && remainingResultSize < 0) || matcher.row == null
+          || !Bytes.equals(row, offset, length, matcher.row, matcher.rowOffset, 
+            matcher.rowLength)) {
+        this.countPerRow = 0;
+        matcher.setRow(row, offset, length);
     }
 
     Cell cell;
@@ -487,6 +505,7 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
 
     int count = 0;
     long totalBytesRead = 0;
+      long totalHeapSize = 0;
 
     LOOP: while((cell = this.heap.peek()) != null) {
       if (prevCell != cell) ++kvsScanned; // Do object compare - we set prevKV from the same heap.
@@ -522,6 +541,7 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
             outResult.add(cell);
             count++;
             totalBytesRead += CellUtil.estimatedSerializedSizeOf(cell);
+            totalHeapSize += CellUtil.estimatedHeapSizeOf(cell);
             if (totalBytesRead > maxRowSize) {
               throw new RowTooBigException("Max row size allowed: " + maxRowSize
               + ", but the row is bigger than that.");
@@ -540,6 +560,9 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
           }
 
           if (limit > 0 && (count == limit)) {
+            break LOOP;
+          }
+          if (remainingResultSize > 0 && (totalHeapSize >= remainingResultSize)) {
             break LOOP;
           }
           continue;

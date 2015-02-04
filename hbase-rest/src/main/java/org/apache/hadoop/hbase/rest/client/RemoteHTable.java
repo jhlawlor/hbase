@@ -545,6 +545,7 @@ public class RemoteHTable implements Table {
 
     @Override
     public Result[] next(int nbRows) throws IOException {
+      System.out.println("RemoteHTable:Scanner:next()");
       StringBuilder sb = new StringBuilder(uri);
       sb.append("?n=");
       sb.append(nbRows);

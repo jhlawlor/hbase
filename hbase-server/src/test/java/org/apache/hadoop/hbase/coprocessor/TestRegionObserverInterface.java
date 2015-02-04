@@ -438,12 +438,17 @@ public class TestRegionObserverInterface {
         }
 
         @Override
-        public boolean next(List<Cell> results, int limit)
-            throws IOException{
+        public boolean next(List<Cell> results, int limit) throws IOException {
+          return next(results, limit, -1);
+        }
+
+        @Override
+        public boolean next(List<Cell> results, int limit, long remainingResultSize)
+            throws IOException {
           List<Cell> internalResults = new ArrayList<Cell>();
           boolean hasMore;
           do {
-            hasMore = scanner.next(internalResults, limit);
+            hasMore = scanner.next(internalResults, limit, remainingResultSize);
             if (!internalResults.isEmpty()) {
               long row = Bytes.toLong(CellUtil.cloneValue(internalResults.get(0)));
               if (row % 2 == 0) {

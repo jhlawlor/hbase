@@ -311,8 +311,10 @@ public class TestTableScan {
     builder.append(Constants.SCAN_COLUMN + "=" + COLUMN_1);
     builder.append("&");
     builder.append(Constants.SCAN_LIMIT + "=20");
+    System.out.println("About to call get");
     Response response = client.get("/" + TABLE + builder.toString(),
       Constants.MIMETYPE_JSON);
+    System.out.println("just got back from get");
     assertEquals(200, response.getCode());
     assertEquals(Constants.MIMETYPE_JSON, response.getHeader("content-type"));
     ObjectMapper mapper = new JacksonProvider()

@@ -22,7 +22,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -30,6 +29,7 @@ import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.client.metrics.ScanMetrics;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.RegionScanner;
@@ -70,9 +70,13 @@ public class ClientSideRegionScanner extends AbstractClientScanner {
 
   @Override
   public Result next() throws IOException {
+    System.out.println("ClientSideRegionScanner.next()");
     values.clear();
 
-    scanner.nextRaw(values, -1); // pass -1 as limit so that we see the whole row.
+    // negative values indicate no limits
+    final long remainingResultSize = -1;
+    final int batchLimit = -1;
+    scanner.nextRaw(values, batchLimit, remainingResultSize);
     if (values.isEmpty()) {
       //we are done
       return null;

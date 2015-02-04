@@ -771,6 +771,8 @@ public class HTable implements HTableInterface {
    */
   @Override
   public ResultScanner getScanner(final Scan scan) throws IOException {
+    // TODO: should be changed to scan.allowPartials() -- partials and small scans should NOT
+    // be used together
     if (scan.getBatch() > 0 && scan.isSmall()) {
       throw new IllegalArgumentException("Small scan should not be used with batching");
     }

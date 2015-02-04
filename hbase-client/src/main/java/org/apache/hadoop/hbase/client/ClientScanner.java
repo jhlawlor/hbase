@@ -17,9 +17,13 @@
  */
 package org.apache.hadoop.hbase.client;
 
+import static org.apache.hadoop.hbase.client.ReversedClientScanner.createClosestRowBefore;
+
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.util.ArrayList;
 import java.util.LinkedList;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 
 import org.apache.commons.logging.Log;
@@ -44,8 +48,6 @@ import org.apache.hadoop.hbase.util.Bytes;
 
 import com.google.common.annotations.VisibleForTesting;
 
-import static org.apache.hadoop.hbase.client.ReversedClientScanner.createClosestRowBefore;
-
 /**
  * Implements the scanner interface for the HBase client.
  * If there are multiple regions in a table, this scanner will iterate
@@ -61,10 +63,14 @@ public class ClientScanner extends AbstractClientScanner {
     protected HRegionInfo currentRegion = null;
     protected ScannerCallableWithReplicas callable = null;
     protected final LinkedList<Result> cache = new LinkedList<Result>();
+    protected final LinkedList<Result> partialResults = new LinkedList<Result>();
+    protected int numberOfCellsInPartialResults = 0;
     protected final int caching;
     protected long lastNext;
     // Keep lastResult returned successfully in case we have to reset scanner.
     protected Result lastResult = null;
+    // Keep a flag to tell us whether or not a partial result was returned from a call to next
+    protected boolean partialResultReturned = false;
     protected final long maxScannerResultSize;
     private final ClusterConnection connection;
     private final TableName tableName;
@@ -330,129 +336,290 @@ public class ClientScanner extends AbstractClientScanner {
       scanMetricsPublished = true;
     }
 
-    @Override
-    public Result next() throws IOException {
-      // If the scanner is closed and there's nothing left in the cache, next is a no-op.
-      if (cache.size() == 0 && this.closed) {
-        return null;
-      }
-      if (cache.size() == 0) {
-        Result [] values = null;
-        long remainingResultSize = maxScannerResultSize;
-        int countdown = this.caching;
-        // We need to reset it if it's a new callable that was created
-        // with a countdown in nextScanner
-        callable.setCaching(this.caching);
-        // This flag is set when we want to skip the result returned.  We do
-        // this when we reset scanner because it split under us.
-        boolean retryAfterOutOfOrderException  = true;
-        do {
-          try {
-            // Server returns a null values if scanning is to stop.  Else,
-            // returns an empty array if scanning is to go on and we've just
-            // exhausted current region.
-            values = call(callable, caller, scannerTimeout);
-            // When the replica switch happens, we need to do certain operations
-            // again. The callable will openScanner with the right startkey
-            // but we need to pick up from there. Bypass the rest of the loop
-            // and let the catch-up happen in the beginning of the loop as it
-            // happens for the cases where we see exceptions. Since only openScanner
-            // would have happened, values would be null
-            if (values == null && callable.switchedToADifferentReplica()) {
-              this.currentRegion = callable.getHRegionInfo();
-              continue;
-            }
-            retryAfterOutOfOrderException  = true;
-          } catch (DoNotRetryIOException e) {
-            // DNRIOEs are thrown to make us break out of retries.  Some types of DNRIOEs want us
-            // to reset the scanner and come back in again.
-            if (e instanceof UnknownScannerException) {
-              long timeout = lastNext + scannerTimeout;
-              // If we are over the timeout, throw this exception to the client wrapped in
-              // a ScannerTimeoutException. Else, it's because the region moved and we used the old
-              // id against the new region server; reset the scanner.
-              if (timeout < System.currentTimeMillis()) {
-                long elapsed = System.currentTimeMillis() - lastNext;
-                ScannerTimeoutException ex = new ScannerTimeoutException(
-                    elapsed + "ms passed since the last invocation, " +
-                        "timeout is currently set to " + scannerTimeout);
-                ex.initCause(e);
-                throw ex;
-              }
-            } else {
-              // If exception is any but the list below throw it back to the client; else setup
-              // the scanner and retry.
-              Throwable cause = e.getCause();
-              if ((cause != null && cause instanceof NotServingRegionException) ||
-                (cause != null && cause instanceof RegionServerStoppedException) ||
-                e instanceof OutOfOrderScannerNextException) {
-                // Pass
-                // It is easier writing the if loop test as list of what is allowed rather than
-                // as a list of what is not allowed... so if in here, it means we do not throw.
-              } else {
-                throw e;
-              }
-            }
-            // Else, its signal from depths of ScannerCallable that we need to reset the scanner.
-            if (this.lastResult != null) {
-              // The region has moved. We need to open a brand new scanner at
-              // the new location.
-              // Reset the startRow to the row we've seen last so that the new
-              // scanner starts at the correct row. Otherwise we may see previously
-              // returned rows again.
-              // (ScannerCallable by now has "relocated" the correct region)
-              if(scan.isReversed()){
-                scan.setStartRow(createClosestRowBefore(lastResult.getRow()));
-              }else {
-                scan.setStartRow(Bytes.add(lastResult.getRow(), new byte[1]));
-              }
-            }
-            if (e instanceof OutOfOrderScannerNextException) {
-              if (retryAfterOutOfOrderException) {
-                retryAfterOutOfOrderException = false;
-              } else {
-                // TODO: Why wrap this in a DNRIOE when it already is a DNRIOE?
-                throw new DoNotRetryIOException("Failed after retry of " +
-                  "OutOfOrderScannerNextException: was there a rpc timeout?", e);
-              }
-            }
-            // Clear region.
-            this.currentRegion = null;
-            // Set this to zero so we don't try and do an rpc and close on remote server when
-            // the exception we got was UnknownScanner or the Server is going down.
-            callable = null;
-            // This continue will take us to while at end of loop where we will set up new scanner.
-            continue;
-          }
-          long currentTime = System.currentTimeMillis();
-          if (this.scanMetrics != null) {
-            this.scanMetrics.sumOfMillisSecBetweenNexts.addAndGet(currentTime-lastNext);
-          }
-          lastNext = currentTime;
-          if (values != null && values.length > 0) {
-            for (Result rs : values) {
-              cache.add(rs);
-              // We don't make Iterator here
-              for (Cell cell : rs.rawCells()) {
-                remainingResultSize -= CellUtil.estimatedHeapSizeOf(cell);
-              }
-              countdown--;
-              this.lastResult = rs;
-            }
-          }
-          // Values == null means server-side filter has determined we must STOP
-        } while (remainingResultSize > 0 && countdown > 0 &&
-            possiblyNextScanner(countdown, values == null));
-      }
-
-      if (cache.size() > 0) {
-        return cache.poll();
-      }
-
-      // if we exhausted this scanner before calling close, write out the scan metrics
-      writeScanMetrics();
+  @Override
+  public Result next() throws IOException {
+    // If the scanner is closed and there's nothing left in the cache, next is a no-op.
+    if (cache.size() == 0 && this.closed) {
       return null;
     }
+    if (cache.size() == 0) {
+      Result[] values = null;
+      long remainingResultSize = maxScannerResultSize;
+      int countdown = this.caching;
+
+      // We need to reset it if it's a new callable that was created
+      // with a countdown in nextScanner
+      callable.setCaching(this.caching);
+      // This flag is set when we want to skip the result returned. We do
+      // this when we reset scanner because it split under us.
+      boolean retryAfterOutOfOrderException = true;
+      do {
+        try {
+          // Reset flag at beginning of each loop
+          partialResultReturned = false;
+
+          // Server returns a null values if scanning is to stop. Else,
+          // returns an empty array if scanning is to go on and we've just
+          // exhausted current region.
+          values = call(callable, caller, scannerTimeout);
+
+          // When the replica switch happens, we need to do certain operations
+          // again. The callable will openScanner with the right startkey
+          // but we need to pick up from there. Bypass the rest of the loop
+          // and let the catch-up happen in the beginning of the loop as it
+          // happens for the cases where we see exceptions. Since only openScanner
+          // would have happened, values would be null
+          if (values == null && callable.switchedToADifferentReplica()) {
+            this.currentRegion = callable.getHRegionInfo();
+            continue;
+          }
+          retryAfterOutOfOrderException = true;
+        } catch (DoNotRetryIOException e) {
+          // DNRIOEs are thrown to make us break out of retries. Some types of DNRIOEs want us
+          // to reset the scanner and come back in again.
+          if (e instanceof UnknownScannerException) {
+            long timeout = lastNext + scannerTimeout;
+            // If we are over the timeout, throw this exception to the client wrapped in
+            // a ScannerTimeoutException. Else, it's because the region moved and we used the old
+            // id against the new region server; reset the scanner.
+            if (timeout < System.currentTimeMillis()) {
+              long elapsed = System.currentTimeMillis() - lastNext;
+              ScannerTimeoutException ex =
+                  new ScannerTimeoutException(elapsed + "ms passed since the last invocation, "
+                      + "timeout is currently set to " + scannerTimeout);
+              ex.initCause(e);
+              throw ex;
+            }
+          } else {
+            // If exception is any but the list below throw it back to the client; else setup
+            // the scanner and retry.
+            Throwable cause = e.getCause();
+            if ((cause != null && cause instanceof NotServingRegionException)
+                || (cause != null && cause instanceof RegionServerStoppedException)
+                || e instanceof OutOfOrderScannerNextException) {
+              // Pass
+              // It is easier writing the if loop test as list of what is allowed rather than
+              // as a list of what is not allowed... so if in here, it means we do not throw.
+            } else {
+              throw e;
+            }
+          }
+          // Else, its signal from depths of ScannerCallable that we need to reset the scanner.
+          if (this.lastResult != null) {
+            // The region has moved. We need to open a brand new scanner at
+            // the new location.
+            // Reset the startRow to the row we've seen last so that the new
+            // scanner starts at the correct row. Otherwise we may see previously
+            // returned rows again.
+            // (ScannerCallable by now has "relocated" the correct region)
+            if (scan.isReversed()) {
+              scan.setStartRow(createClosestRowBefore(lastResult.getRow()));
+            } else {
+              scan.setStartRow(Bytes.add(lastResult.getRow(), new byte[1]));
+            }
+          }
+          if (e instanceof OutOfOrderScannerNextException) {
+            if (retryAfterOutOfOrderException) {
+              retryAfterOutOfOrderException = false;
+            } else {
+              // TODO: Why wrap this in a DNRIOE when it already is a DNRIOE?
+              throw new DoNotRetryIOException("Failed after retry of "
+                  + "OutOfOrderScannerNextException: was there a rpc timeout?", e);
+            }
+          }
+          // Clear region.
+          this.currentRegion = null;
+          // Set this to zero so we don't try and do an rpc and close on remote server when
+          // the exception we got was UnknownScanner or the Server is going down.
+          callable = null;
+
+          // Need to reset the partialResults so that old partials do not stick around
+          partialResults.clear();
+
+          // This continue will take us to while at end of loop where we will set up new scanner.
+          continue;
+        }
+        long currentTime = System.currentTimeMillis();
+        if (this.scanMetrics != null) {
+          this.scanMetrics.sumOfMillisSecBetweenNexts.addAndGet(currentTime - lastNext);
+        }
+        lastNext = currentTime;
+        List<Result> resultsToAddToCache = handlePartialResults(values);
+        if (!resultsToAddToCache.isEmpty()) {
+          for (Result rs : resultsToAddToCache) {
+            cache.add(rs);
+            // We don't make Iterator here
+            for (Cell cell : rs.rawCells()) {
+              remainingResultSize -= CellUtil.estimatedHeapSizeOf(cell);
+            }
+            countdown--;
+            this.lastResult = rs;
+          }
+        }
+        // Values == null means server-side filter has determined we must STOP
+      } while (remainingResultSize > 0 && countdown > 0
+          && (partialResultReturned || possiblyNextScanner(countdown, values == null)));
+    }
+
+    if (cache.size() > 0) {
+      return cache.poll();
+    }
+
+    // if we exhausted this scanner before calling close, write out the scan metrics
+    writeScanMetrics();
+    return null;
+  }
+
+  /**
+   * This method ensures all of our book keeping regarding partial results is kept up to date. This
+   * method should be called once we know that the results we received back from the RPC request do
+   * not contain errors. We return a list of results that should be added to the cache. In general,
+   * this list will contain all NON-partial results from the input array (unless the client has
+   * specified that they are okay with receiving partial results)
+   * @return the list of results that should be added to the cache.
+   */
+  protected List<Result> handlePartialResults(Result[] results) {
+    List<Result> resultsToAddToCache = new ArrayList<Result>();
+
+    // If the caller has indicated in their scan that they are okay with seeing partial results,
+    // then simply add all results to the list.
+    if (scan != null && scan.getAllowPartialResults()) {
+      addResultsFromArray(resultsToAddToCache, results, 0, results.length);
+      return resultsToAddToCache;
+    }
+
+    // TODO: are we sure this shouldn't be included in the next if statement as an OR
+    if (results == null) return resultsToAddToCache;
+
+    if (results.length == 0) {
+      if (!partialResults.isEmpty()) {
+        resultsToAddToCache.add(Result.createCompleteResult(partialResults, null));
+        partialResults.clear();
+      }
+
+      return resultsToAddToCache;
+    }
+
+    // At any given time there should only ever be a single partial result returned. Furthermore, if
+    // there is a partial result, it is guaranteed to be in the last spot. This should be true
+    // because a partial result is formed when the server reaches its result size limit. When this
+    // limit is reached, the row being traversed will be returned in fragments (partials) that must
+    // be reconstructed on the client side.
+    Result last = results[results.length - 1];
+    Result partial = last.isPartial() ? last : null;
+    partialResultReturned = partial != null;
+
+    // TODO: remove; logging stuff -- replace with actual logs
+    System.out.println("\n===START:handlePartialResultsLogs===");
+    System.out.println("partialResultReturned: " + partialResultReturned);
+    System.out.println("contents of results returned: ");
+    long sizeEst = 0;
+    for (int i = 0; i < results.length; i++) {
+      System.out.println("\tresult.toString(): " + results[i].toString());
+      System.out.println("\tcell count: " + results[i].rawCells().length);
+      for (Cell c : results[i].rawCells()) {
+        System.out.println("\t\tCell: " + c.toString() + " size: "
+            + CellUtil.estimatedHeapSizeOf(c));
+
+        sizeEst += CellUtil.estimatedHeapSizeOf(c);
+      }
+    }
+    System.out.println("Size estimate: " + sizeEst);
+
+    // There are four possibilities when a partial result is returned:
+    //
+    // 1. (partial != null && partialResults.isEmpty())
+    //
+    // This is the first partial result that we have received. It should be added to
+    // the list of partialResults and await the next RPC request at which point another
+    // portion of the complete result will be received
+    //
+    // 2. (partial != null && !partialResults.isEmpty())
+    //
+    // a. values.length == 1
+    // Since partialResults contains some elements, it means that we are expecting to receive
+    // the remainder of the complete result within this RPC request. The fact that a partial result
+    // was returned and it's the ONLY result returned indicates that we are still receiving
+    // fragments of the complete result. The Result can be completely formed only when we have
+    // received all of the fragments and thus in this case we simply add the partial result to
+    // our list.
+    //
+    // b. values.length > 1
+    // More than one result has been returned from the server. The fact that we are accumulating
+    // partials in partialList and we just received more than one result back from the server
+    // indicates that the FIRST result we received from the server must be the final fragment that
+    // can be used to complete our result. What this means is that the partial that we received is
+    // a partial result for a different row, and at this point we should combine the existing
+    // partials into a complete result, clear the partialList, and add the new partial to the list
+    //
+    // 3. (partial == null && !partialResults.isEmpty())
+    //
+    // No partial was received but we are accumulating partials in our list. That means the final
+    // fragment of the complete result will be the first Result in values[]. Should take it,
+    // create the complete Result, clear the list, and add it to the list of Results that must be
+    // added to the cache. All other Results in values[] are added after the complete result
+    //
+    // 4. (partial == null && partialResults.isEmpty())
+    //
+    // Business as usual. We are not accumulating partial results and there wasn't a partial result
+    // in the RPC response. This means that all of the results we received from the server are
+    // complete and can be added directly to the cache
+
+    if (partial != null && partialResults.isEmpty()) {
+      System.out.println("ClientScanner: case 1");
+      partialResults.add(partial);
+
+      // Exclude the last result, it's a partial
+      addResultsFromArray(resultsToAddToCache, results, 0, results.length - 1);
+    } else if (partial != null && !partialResults.isEmpty()) {
+      System.out.println("ClientScanner: case 2");
+      if (results.length > 1) {
+        Result finalResult = results[0];
+        resultsToAddToCache.add(Result.createCompleteResult(partialResults, finalResult));
+        partialResults.clear();
+
+        // Exclude first result, it was used to form our complete result
+        // Exclude last result, it's a partial result
+        addResultsFromArray(resultsToAddToCache, results, 1, results.length - 1);
+      }
+      partialResults.add(partial);
+    } else if (partial == null && !partialResults.isEmpty()) {
+      System.out.println("ClientScanner: case 3");
+      Result finalResult = results[0];
+      resultsToAddToCache.add(Result.createCompleteResult(partialResults, finalResult));
+      partialResults.clear();
+
+      // Exclude the first result, it was used to form our complete result
+      addResultsFromArray(resultsToAddToCache, results, 1, results.length);
+    } else { // partial == null && partialResults.isEmpty() -- business as usual
+      System.out.println("ClientScanner: case 4");
+      addResultsFromArray(resultsToAddToCache, results, 0, results.length);
+    }
+
+    // TODO: In the case that Scan#setBatch has been set and a single batch does not fit into the
+    // defined maxResultSize, the batches will be returned as partials of varying sizes. It
+    // is our responsibility to reconstruct the partial Results into results containing the
+    // appropriate number of cells (i.e. each result should contain Scan#batch number of cells
+    // except if it is the final set of cells for the row). This is where we ensure that
+    System.out.println("===END:handlePartialResultsLogs===");
+    System.out.println();
+    return resultsToAddToCache;
+  }
+
+  /**
+   * Helper method for adding results between the indices [start, end] to the outputList
+   * @param outputList the list that results will be added to
+   * @param inputArray the array that results are taken from
+   * @param start beginning index (inclusive)
+   * @param end ending index (exclusive)
+   */
+  private void addResultsFromArray(List<Result> outputList, Result[] inputArray, int start, int end) {
+    if (start < 0 || end > inputArray.length) return;
+
+    for (int i = start; i < end; i++) {
+      outputList.add(inputArray[i]);
+    }
+  }
 
     @Override
     public void close() {

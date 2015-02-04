@@ -95,15 +95,25 @@ public class TestCoprocessorInterface {
     }
 
     @Override
-    public boolean nextRaw(List<Cell> result) 
+    public boolean next(List<Cell> result, int limit, long remainingResultSize) throws IOException {
+      return delegate.next(result, limit, remainingResultSize);
+    }
+
+    @Override
+    public NextRawState nextRaw(List<Cell> result)
         throws IOException {
       return delegate.nextRaw(result);
     }
 
     @Override
-    public boolean nextRaw(List<Cell> result, int limit)
-        throws IOException {
+    public NextRawState nextRaw(List<Cell> result, int limit) throws IOException {
       return delegate.nextRaw(result, limit);
+    }
+
+    @Override
+    public NextRawState nextRaw(List<Cell> result, int limit, long remainingResultSize)
+        throws IOException {
+      return delegate.nextRaw(result, limit, remainingResultSize);
     }
 
     @Override
@@ -135,6 +145,12 @@ public class TestCoprocessorInterface {
     public long getMvccReadPoint() {
       return delegate.getMvccReadPoint();
     }
+
+    @Override
+    public int getBatch() {
+      return delegate.getBatch();
+    }
+
   }
 
   public static class CoprocessorImpl extends BaseRegionObserver {

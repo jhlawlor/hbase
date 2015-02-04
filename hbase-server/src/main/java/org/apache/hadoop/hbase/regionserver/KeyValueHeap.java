@@ -24,9 +24,9 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.PriorityQueue;
 
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.KeyValue.KVComparator;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 
 /**
  * Implements a heap merge across any number of KeyValueScanners.
@@ -132,11 +132,15 @@ public class KeyValueHeap extends NonReversedNonLazyKeyValueScanner
    * @return true if there are more keys, false if all scanners are done
    */
   public boolean next(List<Cell> result, int limit) throws IOException {
+    return next(result, limit, -1);
+  }
+
+  public boolean next(List<Cell> result, int limit, long remainingResultSize) throws IOException {
     if (this.current == null) {
       return false;
     }
     InternalScanner currentAsInternal = (InternalScanner)this.current;
-    boolean mayContainMoreRows = currentAsInternal.next(result, limit);
+    boolean mayContainMoreRows = currentAsInternal.next(result, limit, remainingResultSize);
     Cell pee = this.current.peek();
     /*
      * By definition, any InternalScanner must return false only when it has no

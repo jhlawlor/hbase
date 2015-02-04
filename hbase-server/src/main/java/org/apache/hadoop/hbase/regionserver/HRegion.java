@@ -61,7 +61,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-import com.google.protobuf.ByteString;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
@@ -72,7 +71,6 @@ import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellScanner;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.CompoundConfiguration;
-import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.DroppedSnapshotException;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HColumnDescriptor;
@@ -136,8 +134,8 @@ import org.apache.hadoop.hbase.protobuf.generated.WALProtos.FlushDescriptor.Flus
 import org.apache.hadoop.hbase.protobuf.generated.WALProtos.RegionEventDescriptor;
 import org.apache.hadoop.hbase.regionserver.MultiVersionConsistencyControl.WriteEntry;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionContext;
-import org.apache.hadoop.hbase.regionserver.compactions.NoLimitCompactionThroughputController;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionThroughputController;
+import org.apache.hadoop.hbase.regionserver.compactions.NoLimitCompactionThroughputController;
 import org.apache.hadoop.hbase.regionserver.wal.HLogKey;
 import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
 import org.apache.hadoop.hbase.regionserver.wal.WALUtil;
@@ -4299,8 +4297,14 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver { // 
      * If the joined heap data gathering is interrupted due to scan limits, this will
      * contain the row for which we are populating the values.*/
     protected Cell joinedContinuationRow = null;
-    // KeyValue indicating that limit is reached when scanning
-    private final KeyValue KV_LIMIT = new KeyValue();
+    // KeyValue indicating that batch limit is reached when scanning
+    private final KeyValue KV_BATCH_LIMIT = new KeyValue();
+    /**
+     * KeyValue indicating that size limit is reached when scanning. If the size limit is reached, a
+     * partial {@link Result} will be returned to the client and it will be their responsibility to
+     * form another RPC request to complete the result
+     */
+    private final KeyValue KV_SIZE_LIMIT = new KeyValue();
     protected final byte[] stopRow;
     private final FilterWrapper filter;
     private int batch;
@@ -4385,6 +4389,11 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver { // 
       return this.readPt;
     }
 
+    @Override
+    public int getBatch() {
+      return this.batch;
+    }
+
     /**
      * Reset both the filter and the old filter.
      *
@@ -4405,6 +4414,12 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver { // 
 
     @Override
     public synchronized boolean next(List<Cell> outResults, int limit) throws IOException {
+      return next(outResults, limit, -1);
+    }
+
+    @Override
+    public synchronized boolean next(List<Cell> outResults, int limit, long remainingResultSize)
+        throws IOException {
       if (this.filterClosed) {
         throw new UnknownScannerException("Scanner was closed (timed out?) " +
             "after we renewed it. Could be caused by a very slow scanner " +
@@ -4413,48 +4428,55 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver { // 
       startRegionOperation(Operation.SCAN);
       readRequestsCount.increment();
       try {
-        return nextRaw(outResults, limit);
+        return nextRaw(outResults, limit, remainingResultSize).moreRows();
       } finally {
         closeRegionOperation(Operation.SCAN);
       }
     }
 
     @Override
-    public boolean nextRaw(List<Cell> outResults)
-        throws IOException {
+    public NextRawState nextRaw(List<Cell> outResults) throws IOException {
       return nextRaw(outResults, batch);
     }
 
     @Override
-    public boolean nextRaw(List<Cell> outResults, int limit) throws IOException {
+    public NextRawState nextRaw(List<Cell> outResults, int limit)
+        throws IOException {
+      return nextRaw(outResults, limit, -1);
+    }
+
+    @Override
+    public NextRawState nextRaw(List<Cell> outResults, int limit, long remainingResultSize)
+        throws IOException {
       if (storeHeap == null) {
         // scanner is closed
         throw new UnknownScannerException("Scanner was closed");
       }
-      boolean returnResult;
+      NextRawState state;
       if (outResults.isEmpty()) {
         // Usually outResults is empty. This is true when next is called
         // to handle scan or get operation.
-        returnResult = nextInternal(outResults, limit);
+        state = nextInternal(outResults, limit, remainingResultSize);
       } else {
         List<Cell> tmpList = new ArrayList<Cell>();
-        returnResult = nextInternal(tmpList, limit);
+        state = nextInternal(tmpList, limit, remainingResultSize);
         outResults.addAll(tmpList);
       }
       resetFilters();
       if (isFilterDoneInternal()) {
-        returnResult = false;
+        state = NextRawState.NoMoreRows;
       }
-      return returnResult;
+      return state;
     }
 
-    private void populateFromJoinedHeap(List<Cell> results, int limit)
+    private void populateFromJoinedHeap(List<Cell> results, int limit, long remainingResultSize)
         throws IOException {
       assert joinedContinuationRow != null;
-      Cell kv = populateResult(results, this.joinedHeap, limit,
+      Cell kv =
+          populateResult(results, this.joinedHeap, limit, remainingResultSize,
           joinedContinuationRow.getRowArray(), joinedContinuationRow.getRowOffset(),
           joinedContinuationRow.getRowLength());
-      if (kv != KV_LIMIT) {
+      if (kv != KV_BATCH_LIMIT && kv != KV_SIZE_LIMIT) {
         // We are done with this row, reset the continuation.
         joinedContinuationRow = null;
       }
@@ -4464,8 +4486,11 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver { // 
     }
 
     /**
-     * Fetches records with currentRow into results list, until next row or limit (if not -1).
+     * Fetches records with currentRow into results list, until next row, or limit (if not -1), or
+     * remainingResultSize (if positive) is exceeded
      * @param heap KeyValueHeap to fetch data from.It must be positioned on correct row before call.
+     * @param remainingResultSize The remaining space within our result size limit. Non positive
+     *          values indicate no limit
      * @param limit Max amount of KVs to place in result list, -1 means no limit.
      * @param currentRow Byte array with key we are fetching.
      * @param offset offset for currentRow
@@ -4473,17 +4498,48 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver { // 
      * @return KV_LIMIT if limit reached, next KeyValue otherwise.
      */
     private Cell populateResult(List<Cell> results, KeyValueHeap heap, int limit,
-        byte[] currentRow, int offset, short length) throws IOException {
+        long remainingResultSize, byte[] currentRow, int offset, short length) throws IOException {
       Cell nextKv;
+      boolean moreCellsInRow = false;
       do {
-        heap.next(results, limit - results.size());
+        int remainingLimit = limit - results.size();
+        heap.next(results, remainingLimit, remainingResultSize - calculateResultSize(results));
         if (limit > 0 && results.size() == limit) {
-          return KV_LIMIT;
+          return KV_BATCH_LIMIT;
         }
+
         nextKv = heap.peek();
-      } while (nextKv != null && CellUtil.matchingRow(nextKv, currentRow, offset, length));
+        moreCellsInRow = moreCellsInRow(nextKv, currentRow, offset, length);
+        if (moreCellsInRow && sizeLimitReached(remainingResultSize, results)) {
+          return KV_SIZE_LIMIT;
+        }
+      } while (moreCellsInRow);
 
       return nextKv;
+    }
+
+    private boolean moreCellsInRow(final Cell nextKv, byte[] currentRow, int offset, short length) {
+      return nextKv != null && CellUtil.matchingRow(nextKv, currentRow, offset, length);
+    }
+
+    private boolean sizeLimitReached(final long remainingResultSize, List<Cell> results) {
+      return remainingResultSize > 0 && calculateResultSize(results) >= remainingResultSize;
+    }
+
+    /**
+     * @param results List of cells we want to calculate size of
+     * @return aggregate size of results as estimated by
+     *         {@link CellUtil#estimatedSerializedSizeOf(Cell)}
+     */
+    private long calculateResultSize(List<Cell> results) {
+      if (results == null || results.isEmpty()) return 0;
+
+      long size = 0;
+      for (Cell c : results) {
+        size += CellUtil.estimatedHeapSizeOf(c);
+      }
+
+      return size;
     }
 
     /*
@@ -4498,7 +4554,7 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver { // 
       return this.filter != null && this.filter.filterAllRemaining();
     }
 
-    private boolean nextInternal(List<Cell> results, int limit)
+    private NextRawState nextInternal(List<Cell> results, int limit, long remainingResultSize)
     throws IOException {
       if (!results.isEmpty()) {
         throw new IllegalArgumentException("First parameter should be an empty list");
@@ -4544,27 +4600,35 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver { // 
             if (filter != null && filter.hasFilterRow()) {
               filter.filterRowCells(results);
             }
-            return false;
+            return NextRawState.NoMoreRows;
           }
 
           // Check if rowkey filter wants to exclude this row. If so, loop to next.
           // Technically, if we hit limits before on this row, we don't need this call.
           if (filterRowKey(currentRow, offset, length)) {
             boolean moreRows = nextRow(currentRow, offset, length);
-            if (!moreRows) return false;
+            if (!moreRows) return NextRawState.NoMoreRows;
             results.clear();
             continue;
           }
 
-          Cell nextKv = populateResult(results, this.storeHeap, limit, currentRow, offset,
-              length);
+          Cell nextKv =
+              populateResult(results, this.storeHeap, limit, remainingResultSize, currentRow,
+                offset, length);
           // Ok, we are good, let's try to get some results from the main heap.
-          if (nextKv == KV_LIMIT) {
+          if (nextKv == KV_BATCH_LIMIT) {
             if (this.filter != null && filter.hasFilterRow()) {
               throw new IncompatibleFilterException(
                 "Filter whose hasFilterRow() returns true is incompatible with scan with limit!");
             }
-            return true; // We hit the limit.
+            return NextRawState.BatchLimitReached; // We hit the batch limit.
+          } else if (nextKv == KV_SIZE_LIMIT) {
+            if (this.filter != null && filter.hasFilterRow()) {
+              throw new IncompatibleFilterException(
+                  "Filter whose hasFilterRows() returns true is incompatible with scans that"
+                      + " exceed the size limit");
+            }
+            return NextRawState.SizeLimitReached; // We hit the size limit.
           }
 
           stopRow = nextKv == null ||
@@ -4582,12 +4646,12 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver { // 
           if ((isEmptyRow || ret == FilterWrapper.FilterRowRetCode.EXCLUDE) || filterRow()) {
             results.clear();
             boolean moreRows = nextRow(currentRow, offset, length);
-            if (!moreRows) return false;
+            if (!moreRows) return NextRawState.NoMoreRows;
 
             // This row was totally filtered out, if this is NOT the last row,
             // we should continue on. Otherwise, nothing else to do.
             if (!stopRow) continue;
-            return false;
+            return NextRawState.NoMoreRows;
           }
 
           // Ok, we are done with storeHeap for this row.
@@ -4605,18 +4669,19 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver { // 
                     currentRow, offset, length));
             if (mayHaveData) {
               joinedContinuationRow = current;
-              populateFromJoinedHeap(results, limit);
+              populateFromJoinedHeap(results, limit, remainingResultSize
+                  - calculateResultSize(results));
             }
           }
         } else {
           // Populating from the joined heap was stopped by limits, populate some more.
-          populateFromJoinedHeap(results, limit);
+          populateFromJoinedHeap(results, limit, remainingResultSize - calculateResultSize(results));
         }
 
         // We may have just called populateFromJoinedMap and hit the limits. If that is
         // the case, we need to call it again on the next next() invocation.
         if (joinedContinuationRow != null) {
-          return true;
+          return NextRawState.HasMoreRows;
         }
 
         // Finally, we are done with both joinedHeap and storeHeap.
@@ -4624,12 +4689,12 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver { // 
         // the case when SingleColumnValueExcludeFilter is used.
         if (results.isEmpty()) {
           boolean moreRows = nextRow(currentRow, offset, length);
-          if (!moreRows) return false;
+          if (!moreRows) return NextRawState.NoMoreRows;
           if (!stopRow) continue;
         }
 
         // We are done. Return the result.
-        return !stopRow;
+        return stopRow ? NextRawState.NoMoreRows : NextRawState.HasMoreRows;
       }
     }
 
